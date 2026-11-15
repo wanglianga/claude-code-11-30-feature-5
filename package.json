@@ -1,0 +1,26 @@
+{
+  "name": "guji-collation-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "description": "古籍多版本校勘工作台（纯前端：Vue3 + TypeScript + Pinia + WebWorker）",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "pinia": "^2.2.6",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8",
+    "vue-tsc": "^2.1.10"
+  }
+}

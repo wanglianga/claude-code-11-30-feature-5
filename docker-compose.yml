@@ -1,0 +1,8 @@
+services:
+  collation-web:
+    build: .
+    image: guji-collation-workbench:latest
+    container_name: guji-collation
+    ports:
+      - "8080:80"
+    restart: unless-stopped
