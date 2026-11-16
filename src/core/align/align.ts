@@ -510,6 +510,8 @@ export interface MultiBuildResult {
 /**
  * 以参考本 token 序建立对齐列；参考本之外的新增段落通过非参考本之间的二次对齐归组，
  * 绝不因“不在参考本中”而消失。
+ * 列 id 由参考本 token / 新增段起点确定性生成：重算对齐后同一列仍是同一 id，
+ * 已确认决定与引文锚点不会因 id 漂移而失联。
  */
 export function buildMultiColumns(
   refId: string,
@@ -520,7 +522,7 @@ export function buildMultiColumns(
   const refMap = new Map<number, MultiColumn>()
   refTokens.forEach((t) => {
     const col: MultiColumn = {
-      id: rid('mcol'),
+      id: `mcol:${refId}:t${t.tIndex}`,
       refToken: t.tIndex,
       cells: { [refId]: t.tIndex },
       kinds: { [refId]: 'ref' as CellKind }
@@ -556,15 +558,16 @@ export function buildMultiColumns(
     })
     for (const run of toRuns(gaps)) {
       const key = `${o.versionId}:${run[0]}`
+      const passageId = `ins:${o.versionId}:t${run[0]}`
       const passage: InsertedPassage = {
-        id: rid('ins'),
+        id: passageId,
         ownerVersionId: o.versionId,
         tokenRange: [run[0], run[run.length - 1]],
         groupedWith: []
       }
       insertedByOwner.set(key, passage)
       const col: MultiColumn = {
-        id: rid('mcol'),
+        id: `mcol:ins:${o.versionId}:t${run[0]}`,
         refToken: null,
         insertedPassageId: passage.id,
         cells: { [o.versionId]: run[0] },

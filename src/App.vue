@@ -6,10 +6,11 @@ import ConfigPanel from './components/ConfigPanel.vue'
 import CollationView from './components/CollationView.vue'
 import MovePanel from './components/MovePanel.vue'
 import DecisionPanel from './components/DecisionPanel.vue'
+import CitationPanel from './components/CitationPanel.vue'
 import ProjectPanel from './components/ProjectPanel.vue'
 
 const store = useCollationStore()
-const tab = ref<'manuscripts' | 'config' | 'collation' | 'moves' | 'draft' | 'project'>('collation')
+const tab = ref<'manuscripts' | 'config' | 'collation' | 'moves' | 'draft' | 'citations' | 'project'>('collation')
 const booting = ref(true)
 const bootError = ref('')
 
@@ -35,6 +36,7 @@ onMounted(async () => {
       <button :class="{ active: tab === 'collation' }" @click="tab = 'collation'">校勘對齊</button>
       <button :class="{ active: tab === 'moves' }" @click="tab = 'moves'">移段</button>
       <button :class="{ active: tab === 'draft' }" @click="tab = 'draft'">取捨與采用稿</button>
+      <button :class="{ active: tab === 'citations' }" @click="tab = 'citations'">引文遷移</button>
       <button :class="{ active: tab === 'project' }" @click="tab = 'project'">項目包</button>
     </nav>
   </header>
@@ -51,6 +53,7 @@ onMounted(async () => {
       <CollationView v-else-if="tab === 'collation'" />
       <MovePanel v-else-if="tab === 'moves'" />
       <DecisionPanel v-else-if="tab === 'draft'" />
+      <CitationPanel v-else-if="tab === 'citations'" />
       <ProjectPanel v-else-if="tab === 'project'" />
     </template>
   </main>

@@ -10,10 +10,13 @@ import type {
   AlignmentRevision,
   Annotation,
   CheckReport,
+  Citation,
+  CitationBaseAnchor,
   Decision,
   DecisionKind,
   DraftBlock,
   Manuscript,
+  MigrationResult,
   MoveCandidate,
   MultiColumn,
   NormConfig,
@@ -39,8 +42,18 @@ import {
   moveBlock as draftMoveBlock,
   relocateAnnotation as draftRelocate,
   addAnnotation as draftAddAnnotation,
+  splitBlock as draftSplitBlock,
   type DraftState
 } from '../core/draft'
+import {
+  CitationConflictError,
+  commitMigration,
+  computeMigration,
+  currentDraftRevision,
+  isMigrationCurrent,
+  registerCitation
+} from '../core/citation'
+import { buildCitationCases } from '../core/citationCases'
 import { exportPackage, importPackage, verifyConsistency, type ProjectData } from '../core/package'
 import { detectConflicts, mergePackages, type MergeConflict } from '../core/merge'
 import { applyRecheck, defaultNormLookup, recheckOnNewManuscript } from '../core/recheck'
@@ -73,6 +86,8 @@ interface CollationState {
   draftBlocks: DraftBlock[]
   ops: DraftState['ops']
   annotations: Annotation[]
+  citations: Citation[]
+  citationMigrations: Record<string, MigrationResult>
   selectedPairKey: string | null
   progress: { done: number; total: number } | null
   lastReport: CheckReport | null
@@ -112,6 +127,8 @@ export const useCollationStore = defineStore('collation', {
     draftBlocks: [],
     ops: [],
     annotations: [],
+    citations: [],
+    citationMigrations: {},
     selectedPairKey: null,
     progress: null,
     lastReport: null,
@@ -127,7 +144,25 @@ export const useCollationStore = defineStore('collation', {
     },
     confirmedDecisions: (s) => s.decisions.filter((d) => d.state === 'confirmed'),
     pendingAnnotations: (s) => s.annotations.filter((a) => a.status === 'pending-relocation'),
-    runningCount: (s) => Object.values(s.pairs).filter((p) => p.status === 'running').length
+    runningCount: (s) => Object.values(s.pairs).filter((p) => p.status === 'running').length,
+    draftRevision: (s) => currentDraftRevision(s.ops),
+    /**
+     * 迁移候选仍与现行引用版本、现行采用稿修订一致才可提交。
+     * 已提交的候选从候选表移除，行内改显示引用上留存的最近迁移结论（标“已提交”）。
+     */
+    citationCandidates: (s) =>
+      s.citations.map((c) => {
+        const candidate = s.citationMigrations[c.id] ?? null
+        const last = c.lastMigration ?? null
+        const shown = candidate ?? last
+        return {
+          citation: c,
+          result: shown,
+          isCandidate: candidate !== null,
+          current: candidate ? isMigrationCurrent(candidate, c, currentDraftRevision(s.ops)) : false,
+          applied: !candidate && last !== null
+        }
+      })
   },
 
   actions: {
@@ -404,7 +439,7 @@ export const useCollationStore = defineStore('collation', {
         if (oldBlock) draftDeleteBlock(this.draftState(), oldBlock.id)
         appendBlock(this.draftState(), block)
       }
-      this.persist()
+      this.touchDraft()
       return decision
     },
 
@@ -424,26 +459,50 @@ export const useCollationStore = defineStore('collation', {
 
     insertManualSentence(index: number, text: string): void {
       insertBlockAt(this.draftState(), index, manualBlock(text))
-      this.persist()
+      this.touchDraft()
     },
 
     removeDraftBlock(blockId: string): void {
       draftDeleteBlock(this.draftState(), blockId)
-      this.persist()
+      this.touchDraft()
     },
 
     insertDraftChars(blockId: string, at: number, text: string): void {
       draftInsertChars(this.draftState(), blockId, at, text)
-      this.persist()
+      this.touchDraft()
     },
 
     deleteDraftChars(blockId: string, charIds: string[]): void {
       draftDeleteChars(this.draftState(), blockId, charIds)
-      this.persist()
+      this.touchDraft()
+    },
+
+    splitDraftBlock(blockId: string, at: number): void {
+      draftSplitBlock(this.draftState(), blockId, at)
+      this.touchDraft()
     },
 
     moveDraftBlock(blockId: string, toIndex: number): void {
       draftMoveBlock(this.draftState(), blockId, toIndex)
+      this.touchDraft()
+    },
+
+    /**
+     * 审阅上下文再次修改采用稿：既有迁移候选一律标为失效；已提交的结论不再算候选。
+     * 候选只能基于当次修订提交，改稿后必须重算。
+     */
+    touchDraft(): void {
+      const rev = currentDraftRevision(this.ops)
+      for (const [id, result] of Object.entries(this.citationMigrations)) {
+        const citation = this.citations.find((c) => c.id === id)
+        if (!citation) continue
+        const next = { ...result, stale: !isMigrationCurrent(result, citation, rev) }
+        this.citationMigrations[id] = next
+        if (citation.lastMigration?.computedAt === result.computedAt) {
+          // 已提交的结论同步失效标记，提示其后稿已改
+          citation.lastMigration = next
+        }
+      }
       this.persist()
     },
 
@@ -455,6 +514,163 @@ export const useCollationStore = defineStore('collation', {
     relocateAnnotation(annotationId: string, charIds: string[]): void {
       draftRelocate(this.draftState(), annotationId, charIds)
       this.persist()
+    },
+
+    // ---------- 引文迁移 ----------
+
+    /** 记下旧引文的采用稿范围、底本锚点、前后文、用途与记录时的旧修订 */
+    registerCitation(input: {
+      label: string
+      purpose: string
+      note?: string
+      blockId: string
+      fromCharId: string
+      toCharId: string
+      versionId: string
+      tokenStart: number
+      tokenEnd: number
+      anchorColumnIds: string[]
+    }): Citation | null {
+      const block = this.draftBlocks.find((b) => b.id === input.blockId)
+      if (!block) return null
+      const from = block.chars.findIndex((c) => c.id === input.fromCharId)
+      const to = block.chars.findIndex((c) => c.id === input.toCharId)
+      if (from < 0 || to < 0 || to < from) return null
+      const charIds = block.chars.slice(from, to + 1).map((c) => c.id)
+      const ms = this.manuscriptById(input.versionId)
+      const tokens = ms ? this.tokensOf(input.versionId) : []
+      const anchorText = tokens
+        .slice(input.tokenStart, input.tokenEnd + 1)
+        .map((t) => t.norm)
+        .join('')
+      const before = block.chars.slice(Math.max(0, from - 4), from).map((c) => c.text).join('')
+      const after = block.chars.slice(to + 1, to + 5).map((c) => c.text).join('')
+      const anchor: CitationBaseAnchor = {
+        versionId: input.versionId,
+        tokenStart: input.tokenStart,
+        tokenEnd: input.tokenEnd,
+        text: anchorText
+      }
+      // 未显式给出锚定列时，沿用所在块的校勘列：该列日后被删/合并即可中断操作链
+      const anchorColumnIds = input.anchorColumnIds.length
+        ? [...input.anchorColumnIds]
+        : block.columnId
+          ? [block.columnId]
+          : []
+      const citation = registerCitation({
+        label: input.label,
+        purpose: input.purpose,
+        note: input.note,
+        blocks: this.draftBlocks,
+        span: { blockIds: [block.id], charIds },
+        baseAnchors: [anchor],
+        anchorColumnIds,
+        context: { before, after },
+        draftRevision: currentDraftRevision(this.ops)
+      })
+      this.citations.push(citation)
+      this.persist()
+      return citation
+    },
+
+    /** 从当前选中的字符区间快速登记（同块） */
+    registerCitationFromChars(input: {
+      label: string
+      purpose: string
+      charIds: string[]
+      versionId: string
+      tokenStart: number
+      tokenEnd: number
+    }): Citation | null {
+      if (!input.charIds.length) return null
+      const block = this.draftBlocks.find((b) => b.chars.some((c) => c.id === input.charIds[0]))
+      if (!block) return null
+      const first = block.chars.findIndex((c) => c.id === input.charIds[0])
+      const last = block.chars.findIndex((c) => c.id === input.charIds[input.charIds.length - 1])
+      return this.registerCitation({
+        ...input,
+        blockId: block.id,
+        fromCharId: block.chars[Math.min(first, last)].id,
+        toCharId: block.chars[Math.max(first, last)].id,
+        anchorColumnIds: []
+      })
+    },
+
+    /** 计算迁移候选；不改引文、不改采用稿，结果仍是候选 */
+    computeCitationMigration(citationId: string): MigrationResult | null {
+      const citation = this.citations.find((c) => c.id === citationId)
+      if (!citation) return null
+      const baseTokenCounts: Record<string, number> = {}
+      for (const ms of this.manuscripts) baseTokenCounts[ms.id] = this.tokensOf(ms.id).length
+      const result = computeMigration({
+        citation,
+        blocks: this.draftBlocks,
+        ops: this.ops,
+        columnIds: new Set(this.multiColumns.map((c) => c.id)),
+        baseTokenCounts,
+        draftRevision: currentDraftRevision(this.ops)
+      })
+      this.citationMigrations[citationId] = result
+      this.persist()
+      return result
+    },
+
+    computeAllCitationMigrations(): MigrationResult[] {
+      const out: MigrationResult[] = []
+      for (const c of this.citations) {
+        const r = this.computeCitationMigration(c.id)
+        if (r) out.push(r)
+      }
+      return out
+    },
+
+    /**
+     * 提交迁移：携带旧引用版本或基于旧修订的候选被拒绝，绝不覆盖。
+     * 未解决的候选只能留档，不能改写引文范围。
+     */
+    commitCitationMigration(citationId: string): Citation {
+      const citation = this.citations.find((c) => c.id === citationId)
+      const result = this.citationMigrations[citationId]
+      if (!citation || !result) throw new CitationConflictError('找不到引用或遷移候選', 'stale')
+      const updated = commitMigration(citation, result, currentDraftRevision(this.ops))
+      const idx = this.citations.findIndex((c) => c.id === citationId)
+      this.citations.splice(idx, 1, updated)
+      // 已提交的候选离开候选表；将来再重算才会产生新候选
+      delete this.citationMigrations[citationId]
+      this.persist()
+      return updated
+    },
+
+    /** 重算后仍未失效才允许提交，供 UI 禁用按钮 */
+    canCommitCitation(citationId: string): boolean {
+      const citation = this.citations.find((c) => c.id === citationId)
+      const result = this.citationMigrations[citationId]
+      if (!citation || !result) return false
+      return isMigrationCurrent(result, citation, currentDraftRevision(this.ops)) && result.status !== 'unresolved'
+    },
+
+    removeCitation(citationId: string): void {
+      this.citations = this.citations.filter((c) => c.id !== citationId)
+      delete this.citationMigrations[citationId]
+      this.persist()
+    },
+
+    /** 载入内置四类案例（重复引句 / 改字移段 / 二处拆分 / 锚点删除），仅计算不落盘为既有工程 */
+    loadCitationCases(): { citation: Citation; result: MigrationResult; title: string; expected: string }[] {
+      const cases = buildCitationCases()
+      const out: { citation: Citation; result: MigrationResult; title: string; expected: string }[] = []
+      for (const c of cases) {
+        const result = computeMigration({
+          citation: c.citation,
+          blocks: c.blocks,
+          ops: c.ops,
+          columnIds: new Set(c.columnIds),
+          baseTokenCounts: c.baseTokenCounts,
+          draftRevision: currentDraftRevision(c.ops)
+        })
+        out.push({ citation: c.citation, result, title: c.title, expected: c.expected })
+      }
+      return out
     },
 
     // ---------- 新底本复核 ----------
@@ -504,6 +720,8 @@ export const useCollationStore = defineStore('collation', {
         draftBlocks: this.draftBlocks,
         ops: this.ops,
         annotations: this.annotations,
+        citations: this.citations,
+        citationMigrations: Object.values(this.citationMigrations),
         checksums: { manuscript: {}, chunk: {}, overall: '' }
       }
     },
@@ -523,7 +741,9 @@ export const useCollationStore = defineStore('collation', {
         decisions: this.decisions,
         draftBlocks: this.draftBlocks,
         ops: this.ops,
-        annotations: this.annotations
+        annotations: this.annotations,
+        citations: this.citations,
+        citationMigrations: Object.values(this.citationMigrations)
       }
       const pkg = await exportPackage(data)
       return JSON.stringify(pkg, null, 2)
@@ -540,6 +760,11 @@ export const useCollationStore = defineStore('collation', {
       this.draftBlocks = pkg.draftBlocks
       this.ops = pkg.ops
       this.annotations = pkg.annotations
+      this.citations = pkg.citations ?? []
+      this.citationMigrations = {}
+      for (const result of pkg.citationMigrations ?? []) {
+        this.citationMigrations[result.citationId] = result
+      }
       this.multiColumns = pkg.multiColumns
       this.insertedPassages = pkg.insertedPassages
       this.pairs = {}

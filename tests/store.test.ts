@@ -82,4 +82,73 @@ describe('Pinia 端到端主链路', () => {
     pkg.manuscripts[0].rawText = pkg.manuscripts[0].rawText + '損壞'
     await expect(store.importProject(JSON.stringify(pkg))).rejects.toBeInstanceOf(CorruptPackageError)
   })
+
+  it('引文：登记 → 迁移 → 改稿失效 → 重算 → 提交；导出/导入保留结论', async () => {
+    const store = useCollationStore()
+    await store.loadSample()
+    const target = store.multiColumns[0].id
+    store.submitDecision(target, 'adopt-version', { chosenVersionId: store.referenceId!, reason: '取甲本' })
+    const block = store.draftBlocks.find((b) => b.columnId === target)!
+    const citation = store.registerCitation({
+      label: '首句引文',
+      purpose: '論點支撐',
+      blockId: block.id,
+      fromCharId: block.chars[0].id,
+      toCharId: block.chars[Math.min(3, block.chars.length - 1)].id,
+      versionId: store.referenceId!,
+      tokenStart: 0,
+      tokenEnd: 0,
+      anchorColumnIds: [target]
+    })!
+    expect(citation).toBeTruthy()
+    expect(citation.revision).toBe(1)
+
+    // 计算：位置未变 → 有效候选
+    const result = store.computeCitationMigration(citation.id)!
+    expect(result.path).toBe('ops')
+    expect(store.canCommitCitation(citation.id)).toBe(true)
+
+    // 改稿使候选失效
+    store.insertManualSentence(0, '新增句')
+    expect(store.canCommitCitation(citation.id)).toBe(false)
+    expect(store.citationMigrations[citation.id].stale).toBe(true)
+    expect(() => store.commitCitationMigration(citation.id)).toThrow(/候選已失效|失效/)
+
+    // 重算后可提交
+    const again = store.computeCitationMigration(citation.id)!
+    expect(again.status).toBe('moved')
+    const committed = store.commitCitationMigration(citation.id)
+    expect(committed.revision).toBe(2)
+    expect(committed.history).toHaveLength(1)
+
+    // 导出/导入保留引文与迁移结论
+    const text = await store.exportProject()
+    const report = await store.importProject(text)
+    expect(report.ok).toBe(true)
+    expect(store.citations).toHaveLength(1)
+    expect(store.citations[0].label).toBe('首句引文')
+    // 已提交的结论保存在引用自身，导出/导入后仍可回查
+    expect(store.citations[0].lastMigration?.status).toBe('moved')
+  })
+
+  it('对齐重算后校勘列 id 保持稳定，引文锚点不失联', async () => {
+    const store = useCollationStore()
+    await store.loadSample()
+    const before = store.multiColumns.map((c) => c.id)
+    await store.rerunAll()
+    const after = store.multiColumns.map((c) => c.id)
+    expect(after).toEqual(before)
+  })
+
+  it('内置四类案例在 store 中给出规定结论', () => {
+    const store = useCollationStore()
+    const rows = store.loadCitationCases()
+    const byTitle = new Map(rows.map((r) => [r.title, r.result]))
+    expect(byTitle.get('重複引句')?.status).toBe('unresolved')
+    expect(byTitle.get('二處拆分')?.status).toBe('split')
+    expect(byTitle.get('錨點刪除')?.status).toBe('unresolved')
+    const textMove = byTitle.get('改字移段')!
+    expect(textMove.path).toBe('ops')
+    expect(textMove.status).toBe('text-changed')
+  })
 })

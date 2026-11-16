@@ -203,9 +203,114 @@ export interface Annotation {
 
 export interface DraftOp {
   id: string
-  type: 'insert-block' | 'replace-block' | 'delete-block' | 'insert-chars' | 'delete-chars' | 'move-block'
+  type:
+    | 'insert-block'
+    | 'replace-block'
+    | 'delete-block'
+    | 'insert-chars'
+    | 'delete-chars'
+    | 'move-block'
+    | 'split-block'
   args: Record<string, unknown>
+  rev: number // 采用稿修订号（单调递增），引用迁移据此重放操作链
   at: number
+}
+
+// ---------- 引文迁移 ----------
+
+/** 迁移结论：只允许位置变化、文字变化、拆分关联、删除、未解决五种 */
+export type CitationStatus = 'moved' | 'text-changed' | 'split' | 'deleted' | 'unresolved'
+
+/** 迁移路径：操作链推导 / 局部重对齐 / 两者皆无 */
+export type MigrationPath = 'ops' | 'realign' | 'none'
+
+/** 底本锚点：引文在底本中的比较字符区间（含端点） */
+export interface CitationBaseAnchor {
+  versionId: string
+  tokenStart: number
+  tokenEnd: number
+  text: string
+}
+
+/** 旧引文在采用稿中的原文范围（稳定字符标识，不存下标） */
+export interface CitationSpan {
+  blockIds: string[]
+  charIds: string[]
+  text: string
+}
+
+export interface CitationContext {
+  before: string
+  after: string
+}
+
+/** 每次迁移前的旧修订快照，保留审计 */
+export interface CitationRevisionRecord {
+  revision: number
+  at: number
+  status: CitationStatus
+  span: CitationSpan
+  textFingerprint: string
+  recordedAtRevision: number
+  note: string
+}
+
+export interface Citation {
+  id: string
+  label: string
+  purpose: string // 用途：論點支撐 / 訓詁 / 校記…
+  note?: string
+  span: CitationSpan
+  baseAnchors: CitationBaseAnchor[]
+  anchorColumnIds: string[] // 锚定的校勘列（列被删/合并会使操作链中断）
+  context: CitationContext
+  recordedAtRevision: number // 记录时的采用稿修订（旧修订）
+  revision: number // 引用版本，单调递增，并发任务以此拒绝覆盖
+  recordedAt: number
+  textFingerprint: string // 旧文本指纹
+  status: CitationStatus
+  history: CitationRevisionRecord[]
+  lastMigration?: MigrationResult
+}
+
+/** 迁移后的单段结果（拆分会给出多段） */
+export interface MigrationSegment {
+  blockId: string
+  start: number // 块内字符下标（含）
+  end: number // 块内字符下标（含）
+  charIds: string[]
+  text: string
+  fingerprint: string
+  baseAnchorIndex: number | null
+  baseRange: [number, number] | null // 对应底本 token 区间
+  ambiguousAnchors?: number[]
+}
+
+export interface MigrationCandidate {
+  blockId: string
+  start: number
+  end: number
+  text: string
+  similarity: number
+  fingerprint: string
+}
+
+export interface MigrationResult {
+  citationId: string
+  citationRevision: number // 本次迁移所依据的引用版本
+  recordedAtRevision: number
+  draftRevision: number // 本次迁移所依据的采用稿修订
+  path: MigrationPath
+  status: CitationStatus
+  oldFingerprint: string
+  newFingerprint: string
+  segments: MigrationSegment[]
+  opChain: string[] // 组合后的操作链说明
+  explanation: string[] // 差异说明
+  candidates: MigrationCandidate[] // 未解决时列出全部候选，绝不以最高相似度顶替出处
+  interrupted?: string // 操作链中断原因
+  computedAt: number
+  stale?: boolean // 上下文再次修改后候选失效
 }
 
 export interface CheckReport {
@@ -231,6 +336,8 @@ export interface ProjectPackage {
   draftBlocks: DraftBlock[]
   ops: DraftOp[]
   annotations: Annotation[]
+  citations?: Citation[]
+  citationMigrations?: MigrationResult[]
   checksums: {
     manuscript: Record<string, string>
     chunk: Record<string, string>

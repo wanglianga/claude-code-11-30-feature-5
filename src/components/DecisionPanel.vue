@@ -80,6 +80,14 @@ function relocateTargets(annId: string) {
   store.relocateAnnotation(annId, [...selectedChars.value])
   selectedChars.value = []
 }
+
+/** 以所選首字為界拆塊：前半沿用原塊，後半成為關聯新塊，字符 id 全部保留 */
+function splitAtSelection(block: { id: string; chars: { id: string }[] }) {
+  const at = block.chars.findIndex((c) => c.id === selectedChars.value[0])
+  if (at <= 0) return
+  store.splitDraftBlock(block.id, at)
+  selectedChars.value = []
+}
 </script>
 
 <template>
@@ -180,6 +188,12 @@ function relocateTargets(annId: string) {
           </td>
           <td>
             <button class="ghost" @click="store.moveDraftBlock(block.id, Math.max(0, bi - 1))">上移</button>
+            <button
+              class="ghost"
+              :disabled="selectedChars.length === 0 || !block.chars.some((c) => c.id === selectedChars[0])"
+              :title="'以所選首字為界，將本塊拆為關聯兩段'"
+              @click="splitAtSelection(block)"
+            >拆塊</button>
             <button class="ghost" @click="store.removeDraftBlock(block.id)">刪塊</button>
           </td>
         </tr>

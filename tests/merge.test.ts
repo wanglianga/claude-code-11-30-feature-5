@@ -87,4 +87,60 @@ describe('双包合并', () => {
     const conflicts = detectConflicts(pkg, incoming)
     expect(conflicts.some((c) => c.kind === 'overlapping-move')).toBe(true)
   })
+
+  it('同一引文被两边分别迁移：逐项选择，不允许引用版本高者自动覆盖', async () => {
+    const { pkg } = await basePackage()
+    const base = structuredClone(pkg)
+    const incoming = structuredClone(pkg)
+    const citation = {
+      id: 'cit_1',
+      label: '引文',
+      purpose: '論點支撐',
+      span: { blockIds: ['b1'], charIds: ['c1'], text: '甲' },
+      baseAnchors: [{ versionId: 'jia', tokenStart: 0, tokenEnd: 0, text: '甲' }],
+      anchorColumnIds: [],
+      context: { before: '', after: '' },
+      recordedAtRevision: 0,
+      revision: 2,
+      recordedAt: 1,
+      textFingerprint: 'f1',
+      status: 'moved' as const,
+      history: []
+    }
+    base.citations = [{ ...citation, revision: 1 }]
+    incoming.citations = [{ ...citation, revision: 3, span: { blockIds: ['b2'], charIds: ['c9'], text: '乙' }, textFingerprint: 'f2' }]
+    const conflicts = detectConflicts(base, incoming)
+    expect(conflicts.some((c) => c.kind === 'citation-diverged')).toBe(true)
+    expect(() => mergePackages(base, incoming, {})).toThrow()
+    const pick: Record<string, 'base' | 'incoming'> = {}
+    for (const c of conflicts) pick[c.id] = 'base'
+    const merged = mergePackages(base, incoming, pick).merged
+    expect(merged.citations?.[0].span.text).toBe('甲')
+  })
+
+  it('不相交引文自动合入', async () => {
+    const { pkg } = await basePackage()
+    const base = structuredClone(pkg)
+    const incoming = structuredClone(pkg)
+    const mk = (id: string): any => ({
+      id,
+      label: id,
+      purpose: '校記',
+      span: { blockIds: ['b'], charIds: [id], text: '文' },
+      baseAnchors: [],
+      anchorColumnIds: [],
+      context: { before: '', after: '' },
+      recordedAtRevision: 0,
+      revision: 1,
+      recordedAt: 1,
+      textFingerprint: 'ff',
+      status: 'moved',
+      history: []
+    })
+    base.citations = [mk('cit_a')]
+    incoming.citations = [mk('cit_b')]
+    const outcome = mergePackages(base, incoming, {})
+    expect(outcome.merged.citations).toHaveLength(2)
+    expect(outcome.autoMerged.some((m) => m.includes('新增引文'))).toBe(true)
+  })
 })

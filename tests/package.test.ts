@@ -65,4 +65,66 @@ describe('项目包导出/导入与损坏检测', () => {
     pkg.project.name = '被改名的工程'
     await expect(importPackage(JSON.stringify(pkg))).rejects.toBeInstanceOf(CorruptPackageError)
   })
+
+  it('引文指纹与范围文字不符：一致性核验报错', async () => {
+    const data = await buildData()
+    const pkg = await exportPackage(data)
+    pkg.citations = [
+      {
+        id: 'cit_x',
+        label: '测试引文',
+        purpose: '論點支撐',
+        span: { blockIds: [], charIds: [], text: '甲乙' },
+        baseAnchors: [{ versionId: 'jia', tokenStart: 0, tokenEnd: 1, text: '甲乙' }],
+        anchorColumnIds: [],
+        context: { before: '', after: '' },
+        recordedAtRevision: 0,
+        revision: 1,
+        recordedAt: 1,
+        textFingerprint: 'deadbeef',
+        status: 'moved',
+        history: []
+      }
+    ]
+    const report = verifyConsistency(pkg)
+    expect(report.ok).toBe(false)
+    expect(report.errors.some((e) => e.includes('文本指纹与范围文字不符'))).toBe(true)
+  })
+
+  it('未解决的迁移却携带替换范围：一致性核验报错', async () => {
+    const data = await buildData()
+    const pkg = await exportPackage(data)
+    pkg.citations = []
+    pkg.citationMigrations = [
+      {
+        citationId: 'cit_missing',
+        citationRevision: 1,
+        recordedAtRevision: 0,
+        draftRevision: 0,
+        path: 'realign',
+        status: 'unresolved',
+        oldFingerprint: 'a',
+        newFingerprint: 'a',
+        segments: [
+          {
+            blockId: 'b',
+            start: 0,
+            end: 0,
+            charIds: [],
+            text: 'x',
+            fingerprint: 'a',
+            baseAnchorIndex: null,
+            baseRange: null
+          }
+        ],
+        opChain: [],
+        explanation: [],
+        candidates: [],
+        computedAt: 1
+      }
+    ]
+    const report = verifyConsistency(pkg)
+    expect(report.ok).toBe(false)
+    expect(report.errors.some((e) => e.includes('未解决却携带了替换范围'))).toBe(true)
+  })
 })

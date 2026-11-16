@@ -3,14 +3,20 @@
 //  - 同一异文的相反取舍、移动范围重叠等冲突逐项列出，必须逐项选择，
 //    不允许“后导入整份覆盖”。
 import type {
+  Citation,
   Decision,
   DraftBlock,
+  MigrationResult,
   MoveCandidate,
   ProjectPackage
 } from './types'
 import { CorruptPackageError } from './package'
 
-export type ConflictKind = 'opposite-decision' | 'overlapping-move' | 'same-block-edit'
+export type ConflictKind =
+  | 'opposite-decision'
+  | 'overlapping-move'
+  | 'same-block-edit'
+  | 'citation-diverged'
 
 export interface MergeConflict {
   id: string
@@ -77,6 +83,22 @@ export function detectConflicts(base: ProjectPackage, incoming: ProjectPackage):
         description: '同一出处列的采用稿文字被两边分别修改',
         baseSummary: blockText(bb),
         incomingSummary: blockText(ib)
+      })
+    }
+  }
+  // 4. 引文：同一引文被两边分别迁移/改稿（引用版本不同）必须逐项选择
+  const baseCitations = new Map((base.citations ?? []).map((c) => [c.id, c]))
+  for (const ic of incoming.citations ?? []) {
+    const bc = baseCitations.get(ic.id)
+    if (!bc) continue
+    if (bc.revision !== ic.revision && !sameCitation(bc, ic)) {
+      conflicts.push({
+        id: `cf_cit_${ic.id}`,
+        kind: 'citation-diverged',
+        target: ic.id,
+        description: '同一引文被两邊分別遷移或改寫',
+        baseSummary: `版本 ${bc.revision}：${bc.span.text}（${citationLabel(bc.status)}）`,
+        incomingSummary: `版本 ${ic.revision}：${ic.span.text}（${citationLabel(ic.status)}）`
       })
     }
   }
@@ -169,6 +191,31 @@ export function mergePackages(
   const pairMap = new Map(base.pairAlignments.map((p) => [p.key, p]))
   for (const p of incoming.pairAlignments) if (!pairMap.has(p.key)) pairMap.set(p.key, p)
 
+  // 引文按 id 合并：冲突逐项选择，不相交并入；引用版本高者不自动胜出
+  const citations: Citation[] = [...(base.citations ?? [])]
+  const citIndex = new Map(citations.map((c, i) => [c.id, i]))
+  for (const ic of incoming.citations ?? []) {
+    const at = citIndex.get(ic.id)
+    if (at === undefined) {
+      citations.push(ic)
+      citIndex.set(ic.id, citations.length - 1)
+      autoMerged.push(`新增引文：${ic.label}`)
+      continue
+    }
+    const cf = conflicts.find((c) => c.kind === 'citation-diverged' && c.target === ic.id)
+    if (cf && pick(cf.id) === 'incoming') citations[at] = ic
+  }
+
+  // 迁移结果按 citationId + 引用版本去重，保留两边各自的历史候选
+  const migrations: MigrationResult[] = [...(base.citationMigrations ?? [])]
+  const migKey = (m: MigrationResult) => `${m.citationId}@${m.citationRevision}@${m.draftRevision}`
+  const migSeen = new Set(migrations.map(migKey))
+  for (const m of incoming.citationMigrations ?? []) {
+    if (migSeen.has(migKey(m))) continue
+    migSeen.add(migKey(m))
+    migrations.push(m)
+  }
+
   const merged: ProjectPackage = {
     ...base,
     manuscripts: [...msMap.values()],
@@ -177,6 +224,8 @@ export function mergePackages(
     draftBlocks: blocks,
     annotations,
     ops,
+    citations,
+    citationMigrations: migrations,
     multiColumns: unionById(base.multiColumns, incoming.multiColumns),
     insertedPassages: unionById(base.insertedPassages, incoming.insertedPassages),
     pairAlignments: [...pairMap.values()],
@@ -194,6 +243,26 @@ function unionById<T extends { id: string }>(a: T[], b: T[]): T[] {
 
 function sameDecision(a: Decision, b: Decision): boolean {
   return a.kind === b.kind && a.chosenVersionId === b.chosenVersionId && a.synthesisText === b.synthesisText
+}
+
+function sameCitation(a: Citation, b: Citation): boolean {
+  return (
+    a.textFingerprint === b.textFingerprint &&
+    a.status === b.status &&
+    a.recordedAtRevision === b.recordedAtRevision &&
+    a.span.charIds.join(',') === b.span.charIds.join(',')
+  )
+}
+
+function citationLabel(status: Citation['status']): string {
+  const map: Record<Citation['status'], string> = {
+    moved: '位置變化',
+    'text-changed': '文字變化',
+    split: '拆分關聯',
+    deleted: '刪除',
+    unresolved: '未解決'
+  }
+  return map[status]
 }
 
 function summarizeDecision(d: Decision): string {

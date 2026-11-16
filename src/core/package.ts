@@ -2,11 +2,13 @@
 import type {
   Annotation,
   CheckReport,
+  Citation,
   Decision,
   DraftBlock,
   DraftOp,
   InsertedPassage,
   Manuscript,
+  MigrationResult,
   MoveCandidate,
   MultiColumn,
   NormConfig,
@@ -16,6 +18,7 @@ import type {
 import { checksumOf, sha256Hex } from './hash'
 import { normalize } from './normalize'
 import { fnv1a } from './ids'
+import { citationTextFingerprint } from './citation'
 
 export interface ProjectData {
   project: { name: string; description: string }
@@ -30,6 +33,8 @@ export interface ProjectData {
   draftBlocks: DraftBlock[]
   ops: DraftOp[]
   annotations: Annotation[]
+  citations?: Citation[]
+  citationMigrations?: MigrationResult[]
 }
 
 export async function exportPackage(data: ProjectData): Promise<ProjectPackage> {
@@ -65,6 +70,8 @@ export async function exportPackage(data: ProjectData): Promise<ProjectPackage> 
     draftBlocks: data.draftBlocks,
     ops: data.ops,
     annotations: data.annotations,
+    citations: data.citations ?? [],
+    citationMigrations: data.citationMigrations ?? [],
     checksums: { manuscript, chunk, overall: '' }
   }
   const { checksums, ...rest } = payload
@@ -146,6 +153,8 @@ export function verifyConsistency(pkg: ProjectPackage): CheckReport {
   const warnings: string[] = []
   const msById = new Map((pkg.manuscripts ?? []).map((m) => [m.id, m]))
   const liveCharIds = new Set((pkg.draftBlocks ?? []).flatMap((b) => b.chars.map((c) => c.id)))
+  const charText = new Map<string, string>()
+  for (const b of pkg.draftBlocks ?? []) for (const c of b.chars) charText.set(c.id, c.text)
   const columnIds = new Set((pkg.multiColumns ?? []).map((c) => c.id))
   const passageIds = new Set((pkg.insertedPassages ?? []).map((p) => p.id))
   const decisionIds = new Set((pkg.decisions ?? []).map((d) => d.id))
@@ -184,6 +193,71 @@ export function verifyConsistency(pkg: ProjectPackage): CheckReport {
     }
     if (ann.status === 'pending-relocation' && ann.orphanedFrom.length === 0) {
       warnings.push(`批注 ${ann.id} 处于待重定位但缺少失依记录`)
+    }
+  }
+
+  // 引文：范围字符须在采用稿中；锚点须指向存在的底本与合法区间；
+  // 已落定的迁移结论须与引用范围一致，未解决的不得改写范围
+  for (const cit of pkg.citations ?? []) {
+    for (const id of cit.span.charIds) {
+      if (!liveCharIds.has(id)) errors.push(`引文 ${cit.label} 的范围字符 ${id} 不在采用稿中`)
+    }
+    const spanJoined = cit.span.charIds.map((id) => charText.get(id) ?? '').join('')
+    if (spanJoined !== cit.span.text) {
+      errors.push(`引文 ${cit.label} 的范围文字与稳定字符标识不符`)
+    }
+    if (cit.textFingerprint !== citationTextFingerprint(cit.span.text)) {
+      errors.push(`引文 ${cit.label} 的文本指纹与范围文字不符`)
+    }
+    for (const anchor of cit.baseAnchors) {
+      const ms = msById.get(anchor.versionId)
+      if (!ms) {
+        errors.push(`引文 ${cit.label} 的底本锚点指向不存在的底本 ${anchor.versionId}`)
+        continue
+      }
+      const tokenCount = normalize(ms, pkg.normConfig).tokens.length
+      if (anchor.tokenStart < 0 || anchor.tokenEnd >= tokenCount || anchor.tokenEnd < anchor.tokenStart) {
+        errors.push(`引文 ${cit.label} 的底本锚点越界：[${anchor.tokenStart},${anchor.tokenEnd}] vs ${tokenCount}`)
+      }
+    }
+    for (const anchorColumn of cit.anchorColumnIds) {
+      if (!columnIds.has(anchorColumn)) {
+        warnings.push(`引文 ${cit.label} 锚定的校勘列 ${anchorColumn} 已不存在（需重新迁移或人工指定）`)
+      }
+    }
+    if (cit.status === 'unresolved') {
+      warnings.push(`引文 ${cit.label} 仍为未解决，未写入正式范围`)
+    }
+  }
+
+  // 迁移结果：引文须存在；未解决结果不得带 segment 改写范围；已解决的 segment 字符须仍在采用稿中
+  const citationIds = new Set((pkg.citations ?? []).map((c) => c.id))
+  for (const m of pkg.citationMigrations ?? []) {
+    if (!citationIds.has(m.citationId)) {
+      errors.push(`迁移结果 ${m.citationId} 指向不存在的引文`)
+    }
+    if (m.status === 'unresolved' && m.segments.length > 0) {
+      errors.push(`迁移结果 ${m.citationId} 未解决却携带了替换范围`)
+    }
+    if (m.status !== 'unresolved' && m.segments.length === 0) {
+      errors.push(`迁移结果 ${m.citationId} 结论为 ${m.status} 却没有可回查范围`)
+    }
+    for (const seg of m.segments) {
+      for (const id of seg.charIds) {
+        if (!liveCharIds.has(id)) errors.push(`迁移结果 ${m.citationId} 的片段字符 ${id} 不在采用稿中`)
+      }
+    }
+    if (m.oldFingerprint === m.newFingerprint && m.status === 'text-changed') {
+      warnings.push(`迁移结果 ${m.citationId} 标为文字变化但新旧指纹相同`)
+    }
+    const expectedNew =
+      m.status === 'deleted'
+        ? citationTextFingerprint('')
+        : m.status === 'unresolved'
+          ? m.oldFingerprint
+          : citationTextFingerprint(m.segments.map((s) => s.text).join(''))
+    if (expectedNew !== m.newFingerprint) {
+      errors.push(`迁移结果 ${m.citationId} 的新文本指纹与结论范围不符`)
     }
   }
 

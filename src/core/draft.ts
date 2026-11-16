@@ -10,6 +10,7 @@ import type {
   DraftOp
 } from './types'
 import { rid } from './ids'
+import { nextDraftRevision } from './citation'
 
 export function makeChar(text: string, anchor: DraftChar['anchor']): DraftChar {
   return { id: rid('dc'), text, anchor }
@@ -37,14 +38,17 @@ export interface DraftState {
   annotations: Annotation[]
 }
 
-function logOp(ops: DraftOp[], type: DraftOp['type'], args: Record<string, unknown>): void {
-  ops.push({ id: rid('op'), type, args, at: Date.now() })
+function logOp(ops: DraftOp[], type: DraftOp['type'], args: Record<string, unknown>): DraftOp {
+  // rev 单调递增：引文迁移据此判断操作链是否连续、能否组合重放
+  const op: DraftOp = { id: rid('op'), type, args, rev: nextDraftRevision(ops), at: Date.now() }
+  ops.push(op)
+  return op
 }
 
 /** 校勘员在采用稿前面加一句：插入新块，既有字符 id 与锚点不变，批注不会挪错 */
 export function insertBlockAt(state: DraftState, index: number, block: DraftBlock): void {
   state.blocks.splice(index, 0, block)
-  logOp(state.ops, 'insert-block', { index, blockId: block.id })
+  logOp(state.ops, 'insert-block', { index, blockId: block.id, block })
 }
 
 export function appendBlock(state: DraftState, block: DraftBlock): void {
@@ -55,18 +59,21 @@ export function deleteBlock(state: DraftState, blockId: string): void {
   const idx = state.blocks.findIndex((b) => b.id === blockId)
   if (idx < 0) return
   const removed = state.blocks[idx]
-  orphanAnnotations(state, removed.chars.map((c) => c.id))
+  const charIds = removed.chars.map((c) => c.id)
+  orphanAnnotations(state, charIds)
   state.blocks.splice(idx, 1)
-  logOp(state.ops, 'delete-block', { blockId, charIds: removed.chars.map((c) => c.id) })
+  logOp(state.ops, 'delete-block', { blockId, charIds, removedCharIds: charIds })
 }
 
 /** 在块内插入文字（校勘员增补），新字符为 manual 锚点，不影响既有字符标识 */
-export function insertChars(state: DraftState, blockId: string, at: number, text: string): void {
+export function insertChars(state: DraftState, blockId: string, at: number, text: string): DraftBlock['chars'] {
   const block = state.blocks.find((b) => b.id === blockId)
-  if (!block) return
+  if (!block) return []
   const add = Array.from(text).map((code) => makeChar(code, { type: 'manual' }))
   block.chars.splice(at, 0, ...add)
-  logOp(state.ops, 'insert-chars', { blockId, at, charIds: add.map((c) => c.id) })
+  // 记录新字符本体：引文迁移的操作链据此解释插字，而不只依赖字符 id
+  logOp(state.ops, 'insert-chars', { blockId, at, chars: add, charIds: add.map((c) => c.id) })
+  return add
 }
 
 /** 删除文字：按稳定 id 命中（不用下标），承载批注则令批注待重定位 */
@@ -79,6 +86,22 @@ export function deleteChars(state: DraftState, blockId: string, charIds: string[
   logOp(state.ops, 'delete-chars', { blockId, charIds })
 }
 
+/**
+ * 在块内第 at 个字符处拆成两段：前段沿用原块 id，后段取新 id。
+ * 字符 id 全部保留，因此批注与引文可继续按标识挂靠；两段视为关联。
+ */
+export function splitBlock(state: DraftState, blockId: string, at: number): DraftBlock | null {
+  const idx = state.blocks.findIndex((b) => b.id === blockId)
+  if (idx < 0) return null
+  const block = state.blocks[idx]
+  if (at <= 0 || at >= block.chars.length) return null
+  const head: DraftBlock = { ...block, chars: block.chars.slice(0, at) }
+  const tail: DraftBlock = { ...block, id: rid('blk'), chars: block.chars.slice(at) }
+  state.blocks.splice(idx, 1, head, tail)
+  logOp(state.ops, 'split-block', { blockId, at, tailBlockId: tail.id })
+  return tail
+}
+
 export function replaceBlock(state: DraftState, blockId: string, next: DraftBlock): void {
   const idx = state.blocks.findIndex((b) => b.id === blockId)
   if (idx < 0) return
@@ -87,7 +110,12 @@ export function replaceBlock(state: DraftState, blockId: string, next: DraftBloc
   const gone = oldIds.filter((id) => !newIds.has(id))
   orphanAnnotations(state, gone)
   state.blocks.splice(idx, 1, next)
-  logOp(state.ops, 'replace-block', { blockId, nextBlockId: next.id, removedCharIds: gone })
+  logOp(state.ops, 'replace-block', {
+    blockId,
+    nextBlockId: next.id,
+    removedCharIds: gone,
+    nextBlock: next
+  })
 }
 
 export function moveBlock(state: DraftState, blockId: string, toIndex: number): void {

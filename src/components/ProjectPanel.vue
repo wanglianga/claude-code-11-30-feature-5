@@ -24,7 +24,8 @@ async function doExportAdopted() {
     store.manuscripts,
     store.normConfig,
     store.draftBlocks,
-    store.decisions
+    store.decisions,
+    store.citations
   )
   downloadText(`adopted-with-provenance-${Date.now()}.md`, md, 'text/markdown')
 }
@@ -135,7 +136,7 @@ async function exportTamperedDemo() {
             <tr v-for="c in conflicts" :key="c.id">
               <td>
                 <span class="tag warn">
-                  {{ c.kind === 'opposite-decision' ? '相反取舍' : c.kind === 'overlapping-move' ? '移段重疊' : '同塊改動' }}
+                  {{ c.kind === 'opposite-decision' ? '相反取舍' : c.kind === 'overlapping-move' ? '移段重疊' : c.kind === 'citation-diverged' ? '引文分歧' : '同塊改動' }}
                 </span>
               </td>
               <td>{{ c.description }}</td>
